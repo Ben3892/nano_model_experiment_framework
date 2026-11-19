@@ -52,6 +52,41 @@ CUDA_VISIBLE_DEVICES=0 python -m src.train --backend megatron-patch \
 
 每次实验使用新输出目录，保留训练和验证输入快照、`config.json`、`metrics.jsonl`、`summary.json` 及 checkpoint。Patch 训练另外保留 `megatron.log` 和 `launch.json`。两阶段分别在各自的验证协议下统计 loss。
 
+## RSI 递归自训练
+
+使用 Python 3.11 或更新版本。CPU demo 先用固定的算术样本训练种子模型，再用当前晋级 checkpoint 采样。控制器用整数答案判分，混入 replay，复用现有训练入口做下一轮 SFT，并在独立的 dev 集上决定是否晋级。
+
+```bash
+python -m src.rsi.run_round --demo --rounds 2 --output runs/rsi-demo
+python -m src.rsi.run_round --demo --rounds 2 --generator-mode frozen --output runs/rsi-frozen
+```
+
+`frozen` 始终用种子权重生成数据，各轮 SFT 仍从该实验臂当前晋级权重开始。对照时核对两臂的实际训练和采样预算，以及触发提前停止的轮次。内置题目只有个位数加零和分开的标签，适合验证流程与 checkpoint 流转。
+
+使用 PyTorch 2.7.1 CPU、固定配比和 seed 42 各跑四轮，两组各消耗 29,440 个训练 token 位置、7,680 个采样 token 位置。合成盲测的 `pass@1` 从种子模型的 15.00% 提升至递归组的 83.75% 和冻结生成器组的 71.25%。盲测仅含 10 道模板题。另一次把晋级门槛调至 20 个百分点，后两轮未达标，控制器停止并保留第二轮权重。
+
+自定义实验通过 `--data-dir DIR --init-from WEIGHTS.pt` 指定初始 Torch checkpoint 和数据。该 checkpoint 的模型结构和 `--seq-len` 应与 Torch 训练入口一致。目录下有五个 JSONL 文件，每行形如 `{"id":"q01","family":"signed-add","prompt":"-3 + 2 = ?","answer":-1}`。同一个 ID、规范化 prompt 或题族不得跨 split 重用。
+
+| 文件 | 用途 |
+| --- | --- |
+| `rollout.jsonl` | 采样 prompt，答案用于外部整数验证 |
+| `replay.jsonl` | 固定的高质量监督样本 |
+| `monitor.jsonl` | 训练期间记录 SFT validation loss |
+| `dev.jsonl` | 每轮晋级判定 |
+| `blind.jsonl` | 停止后比较初始与最终选定 checkpoint |
+
+判分接受整数，或最后一行形如 `Final: -1` 的完整回复。采样序列需要 EOS，长回复需增大 `--max-new-tokens` 并留出上下文空间。每题最多入选两条不同的正确回复。触及新数据 token 上限时优先覆盖部分采样正确的题。Replay 比例按入库的有效监督 token 估算，`decision.json` 记录实际入库比例。
+
+晋级要求 dev 的 `pass@1` 增益达到 `--min-gain`，按题配对 bootstrap 的置信区间下界大于零，各题族回退低于 `--max-regression`。评估同时记录 `pass@k` 和原本稳定题的退化情况。用 `--eval-samples 32` 或更高计算 `pass@32`。当正样本不足、连续未晋级、轮数或 token 预算触顶时停止。预算覆盖初始评估、训练轮次和最后的盲测。训练失败会保留此前晋级的 `best.json`。
+
+使用 DSH 时，先在运行环境中配置 DSH CLI 和模型凭据，例如默认 DeepSeek API 路由使用 `DEEPSEEK_API_KEY`。Headless 模式接收聚合指标，通过 stdout 返回 JSON。控制器仅采纳 0.1–0.5 范围内的 `replay_fraction`，超时或无效 JSON 时沿用本轮比例。[DeepSeek Harness headless CLI](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/cli-help.md#dsh-headless)
+
+```bash
+python -m src.rsi.run_round --demo --rounds 3 --planner dsh --output runs/rsi-dsh
+```
+
+`run.json` 记录配置和数据哈希，`round_*/decision.json` 保存候选、生成器、父 checkpoint、入库统计与晋级依据，`best.json` 指向已晋级模型，`summary.json` 汇总 token 预算和盲测结果。RSI 的训练和采样当前使用 Torch CPU 后端。Pai-Megatron-Patch 可用现有独立训练入口，接入 RSI 还需要对接可供 rollout 使用的 Megatron checkpoint。
+
 ## 后续实现
 
 - 接入 verl，记录 rollout、reward 和训练日志，先跑通可复现的 RL 实验。

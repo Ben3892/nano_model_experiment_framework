@@ -20,6 +20,11 @@ def byte_tokens(text):
     return list(text.encode("utf-8"))
 
 
+def sft_prompt_tokens(prompt):
+    prompt = unicodedata.normalize("NFC", prompt)
+    return byte_tokens(f"User: {prompt}\nAssistant: ")
+
+
 def builtin_rows(stage, split):
     examples = []
     start, count = (0, 96) if split == "train" else (100, 24)
@@ -60,7 +65,7 @@ def sft_example(row, seq_len):
     prompt, answer = (unicodedata.normalize("NFC", row[key]) for key in ("prompt", "response"))
     if any(token in prompt or token in answer for token in SPECIAL_TOKENS):
         raise ValueError("SFT prompt and response cannot contain reserved tokenizer tokens")
-    prefix = byte_tokens(f"User: {prompt}\nAssistant: ")
+    prefix = sft_prompt_tokens(prompt)
     response = byte_tokens(answer) + [EOS]
     tokens = prefix + response
     if len(tokens) > seq_len:

@@ -17,6 +17,15 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def load_torch_checkpoint(path):
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    if state["stage"] not in ("pretrain", "sft"):
+        raise ValueError("expected a Torch pretrain or SFT checkpoint")
+    model = DenseGPT(DenseGPTConfig(**state["model_config"]))
+    model.load_state_dict(state["model"])
+    return model
+
+
 def torch_sampler(stage, rows, seq_len, batch_size, seed):
     generator = torch.Generator().manual_seed(seed)
     if stage == "sft":
@@ -48,12 +57,15 @@ def run_torch(args, rows, record):
         intermediate_size=256,
         num_heads=4,
     )
-    model = DenseGPT(config)
     if args.init_from:
-        checkpoint = torch.load(args.init_from, map_location="cpu", weights_only=True)
-        if checkpoint["stage"] != "pretrain" or checkpoint["model_config"] != vars(config):
-            raise ValueError("SFT needs a Torch pretrain checkpoint with matching model config and seq_len")
-        model.load_state_dict(checkpoint["model"])
+        model = load_torch_checkpoint(args.init_from)
+        if model.config != config:
+            raise ValueError("SFT needs a Torch checkpoint with matching model config and seq_len")
+    else:
+        model = DenseGPT(config)
+    # Loading builds a temporary model before restoring its weights. Keep the
+    # training RNG tied to the run seed for both initialization paths.
+    torch.manual_seed(args.seed)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     train = torch_sampler(args.stage, rows["train"], args.seq_len, args.batch_size, args.seed)
     valid = torch_sampler(args.stage, rows["valid"], args.seq_len, args.batch_size, args.seed + 1)
@@ -73,9 +85,12 @@ def run_torch(args, rows, record):
         return value
 
     initial = evaluate(0)
+    supervised_tokens = 0
     for step in range(1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
-        train_loss = loss(train())
+        batch = train()
+        supervised_tokens += batch[1].ne(IGNORE).sum().item()
+        train_loss = loss(batch)
         if not torch.isfinite(train_loss):
             raise RuntimeError(f"non-finite training loss at step {step}")
         train_loss.backward()
@@ -91,6 +106,8 @@ def run_torch(args, rows, record):
     return {
         "steps": args.steps,
         "parameters": model.num_parameters(),
+        "train_token_slots": args.steps * args.batch_size * args.seq_len,
+        "supervised_tokens": supervised_tokens,
         "initial_valid_loss": initial,
         "valid_loss": final,
         "checkpoint": str(checkpoint),
@@ -110,7 +127,7 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-data", type=Path)
     parser.add_argument("--valid-data", type=Path)
-    parser.add_argument("--init-from", type=Path, help="pretrain checkpoint from the same backend")
+    parser.add_argument("--init-from", type=Path, help="pretrain or SFT checkpoint from the same backend")
     parser.add_argument("--patch-root", type=Path, help="Pai-Megatron-Patch checkout")
     parser.add_argument("--prepare-only", action="store_true", help="prepare Patch inputs without a GPU")
     args = parser.parse_args(argv)
