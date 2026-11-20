@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+import unicodedata
 
 import torch
 
@@ -15,6 +16,7 @@ from .experiment_data import CHAT_TEMPLATE, EOS, SPECIAL_TOKENS, VOCAB_SIZE, byt
 CORE = Path("backends/megatron/Megatron-LM-250624")
 ENTRYPOINT = Path("examples/qwen3/pretrain_qwen.py")
 TRACKER = "latest_checkpointed_iteration.txt"
+PADDED_VOCAB_SIZE = 384
 TRAIN_LINE = re.compile(
     r"\biteration\s+(\d+)\s*/\s*\d+.*?"
     r"number of skipped iterations:\s*(\d+).*?number of nan iterations:\s*(\d+)"
@@ -23,20 +25,47 @@ TRAIN_LOSS = re.compile(r"\blm loss:\s*(\S+)")
 VALID_LINE = re.compile(r"validation loss at iteration (\d+) on validation set.*?lm loss value:\s*(\S+)")
 
 
-def check_environment(args):
-    root = args.patch_root
+def checkpoint_files(root, expected_iteration=None):
+    tracker = root / TRACKER
+    if not tracker.is_file():
+        raise ValueError(f"missing Megatron checkpoint tracker: {tracker}")
+    value = tracker.read_text(encoding="utf-8").strip()
+    if not value.isdecimal() or int(value) < 1:
+        raise ValueError(f"expected a positive Megatron iteration in {tracker}, got {value!r}")
+    iteration = int(value)
+    if expected_iteration is not None and iteration != expected_iteration:
+        raise ValueError(f"checkpoint tracker at {root} changed from {expected_iteration} to {iteration}")
+    step_dir = root / f"iter_{iteration:07d}"
+    shards = sorted(step_dir.glob("*.distcp"))
+    files = [step_dir / "common.pt", step_dir / ".metadata", *shards]
+    if not shards or any(not path.is_file() or not path.stat().st_size for path in files):
+        raise ValueError(f"incomplete torch_dist checkpoint: {step_dir}")
+    return iteration, files
+
+
+def check_patch_root(root):
     if not (root / ENTRYPOINT).is_file() or not (root / CORE / "megatron/training/training.py").is_file():
         raise ValueError(f"expected {ENTRYPOINT} and initialized {CORE} under {root}")
-    if args.init_from and not (args.init_from / TRACKER).is_file():
-        raise ValueError(f"missing Megatron checkpoint tracker: {args.init_from / TRACKER}")
-    if not args.prepare_only and (
-        not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(including_emulation=False)
-    ):
-        raise RuntimeError("Megatron-Patch MVP requires a BF16-capable NVIDIA GPU")
 
 
-def write_tokenizer(directory):
-    directory.mkdir()
+def check_gpus(nproc):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < nproc:
+        raise RuntimeError(f"Megatron-Patch requires {nproc} visible NVIDIA GPU(s)")
+    for device in range(nproc):
+        with torch.cuda.device(device):
+            if not torch.cuda.is_bf16_supported(including_emulation=False):
+                raise RuntimeError(f"GPU {device} does not support native BF16")
+
+
+def check_environment(args):
+    check_patch_root(args.patch_root)
+    if args.init_from:
+        args.init_iteration, _ = checkpoint_files(args.init_from, args.init_iteration)
+    if not args.prepare_only:
+        check_gpus(args.nproc_per_node)
+
+
+def tokenizer_files():
     # Qwen2 slow BPE uses the GPT-2 byte alphabet. With zero merges every UTF-8
     # byte retains its original ID, so both backends use the same corpus tokens.
     alphabet = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
@@ -44,8 +73,6 @@ def write_tokenizer(directory):
     vocab = {chr(byte): byte for byte in alphabet}
     vocab.update({chr(256 + index): byte for index, byte in enumerate(extra)})
     vocab.update(SPECIAL_TOKENS)
-    (directory / "vocab.json").write_text(json.dumps(vocab), encoding="utf-8")
-    (directory / "merges.txt").write_text("#version: 0.2\n", encoding="utf-8")
     config = {
         "tokenizer_class": "Qwen2Tokenizer",
         "eos_token": "</s>",
@@ -53,7 +80,17 @@ def write_tokenizer(directory):
         "unk_token": "<unk>",
         "chat_template": CHAT_TEMPLATE,
     }
-    (directory / "tokenizer_config.json").write_text(json.dumps(config), encoding="utf-8")
+    return {
+        "vocab.json": json.dumps(vocab),
+        "merges.txt": "#version: 0.2\n",
+        "tokenizer_config.json": json.dumps(config),
+    }
+
+
+def write_tokenizer(directory):
+    directory.mkdir()
+    for name, contents in tokenizer_files().items():
+        (directory / name).write_text(contents, encoding="utf-8")
 
 
 def write_indexed_data(args, rows):
@@ -80,31 +117,48 @@ def write_sft_data(directory, rows):
     for split, examples in rows.items():
         with (directory / f"{split}.jsonl").open("w", encoding="utf-8") as file:
             for row in examples:
-                example = {"query": row["prompt"], "response": row["response"]}
+                example = {
+                    "query": unicodedata.normalize("NFC", row["prompt"]),
+                    "response": unicodedata.normalize("NFC", row["response"]),
+                }
                 file.write(json.dumps(example, ensure_ascii=False) + "\n")
 
 
-def build_command(args, tokenizer, checkpoint):
-    command = [
-        sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc-per-node=1",
-        str(args.patch_root / ENTRYPOINT),
+def model_arguments(seq_len, tokenizer):
+    return [
         "--num-layers", "2", "--hidden-size", "128", "--num-attention-heads", "4",
         "--ffn-hidden-size", "256", "--kv-channels", "32",
-        "--seq-length", str(args.seq_len), "--max-position-embeddings", str(args.seq_len),
-        "--micro-batch-size", str(args.batch_size), "--global-batch-size", str(args.batch_size),
-        "--train-iters", str(args.steps), "--eval-iters", str(args.eval_batches),
-        "--eval-interval", str(args.steps + 1), "--log-interval", "1", "--num-workers", "0",
-        "--lr", str(args.lr), "--lr-decay-style", "constant", "--seed", str(args.seed),
-        "--weight-decay", "0.01", "--clip-grad", "1.0",
+        "--seq-length", str(seq_len), "--max-position-embeddings", str(seq_len),
         "--attention-dropout", "0.0", "--hidden-dropout", "0.0",
         "--tokenizer-type", "NullTokenizer", "--vocab-size", str(VOCAB_SIZE),
-        "--patch-tokenizer-type", "Qwen3Tokenizer", "--padded-vocab-size", "384",
+        "--patch-tokenizer-type", "Qwen3Tokenizer", "--padded-vocab-size", str(PADDED_VOCAB_SIZE),
         "--transformer-impl", "transformer_engine", "--attention-backend", "unfused", "--bf16",
         "--swiglu", "--normalization", "RMSNorm", "--norm-epsilon", "1e-6", "--qk-layernorm",
         "--position-embedding-type", "rope", "--rotary-base", "1000000", "--disable-bias-linear",
         "--no-rope-fusion", "--no-masked-softmax-fusion", "--no-gradient-accumulation-fusion",
-        "--load", str(tokenizer), "--save", str(checkpoint),
-        "--save-interval", str(args.steps), "--ckpt-format", "torch_dist",
+        "--load", str(tokenizer), "--ckpt-format", "torch_dist",
+    ]
+
+
+def warmstart_arguments(root, iteration):
+    return ["--pretrained-checkpoint", str(root), "--ckpt-step", str(iteration), "--finetune"]
+
+
+def launch_prefix(nproc):
+    return [sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc-per-node={nproc}"]
+
+
+def build_command(args, tokenizer, checkpoint):
+    command = [
+        *launch_prefix(args.nproc_per_node), str(args.patch_root / ENTRYPOINT),
+        *model_arguments(args.seq_len, tokenizer),
+        "--micro-batch-size", str(args.batch_size // args.nproc_per_node),
+        "--global-batch-size", str(args.batch_size),
+        "--train-iters", str(args.steps), "--eval-iters", str(args.eval_batches),
+        "--eval-interval", str(args.steps + 1), "--log-interval", "1", "--num-workers", "0",
+        "--lr", str(args.lr), "--lr-decay-style", "constant", "--seed", str(args.seed),
+        "--weight-decay", "0.01", "--clip-grad", "1.0",
+        "--save", str(checkpoint), "--save-interval", str(args.steps),
     ]
     if args.stage == "pretrain":
         command += [
@@ -121,8 +175,34 @@ def build_command(args, tokenizer, checkpoint):
             "--eod-mask-loss", "--calculate-per-token-loss",
         ]
     if args.init_from:
-        command += ["--pretrained-checkpoint", str(args.init_from), "--finetune"]
+        command += warmstart_arguments(args.init_from, args.init_iteration)
     return command
+
+
+def launch_environment(patch_root):
+    paths = [str(patch_root), str(patch_root / CORE)]
+    if os.environ.get("PYTHONPATH"):
+        paths.append(os.environ["PYTHONPATH"])
+    return {
+        "PYTHONPATH": os.pathsep.join(paths),
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1",
+        "NVTE_FLASH_ATTN": "0",
+        "NVTE_FUSED_ATTN": "0",
+        "NVTE_UNFUSED_ATTN": "1",
+    }
+
+
+def check_warmstart(log, root, iteration):
+    loading = f"loading distributed checkpoint from {root} at iteration {iteration}"
+    loaded = f"successfully loaded checkpoint from {root} ["
+    with log.open(encoding="utf-8", errors="replace") as file:
+        saw_loading = saw_loaded = False
+        for line in file:
+            saw_loading |= line.strip() == loading
+            saw_loaded |= loaded in line and line.rstrip().endswith("at iteration 0")
+    if not (saw_loading and saw_loaded):
+        raise RuntimeError(f"could not confirm warm start from {root} iteration {iteration}; see {log}")
 
 
 def run_patch(args, rows, record):
@@ -134,17 +214,7 @@ def run_patch(args, rows, record):
     else:
         write_sft_data(args.output / "patch-data", rows)
     command = build_command(args, tokenizer, checkpoint)
-    paths = [str(args.patch_root), str(args.patch_root / CORE)]
-    if os.environ.get("PYTHONPATH"):
-        paths.append(os.environ["PYTHONPATH"])
-    environment = {
-        "PYTHONPATH": os.pathsep.join(paths),
-        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1",
-        "NVTE_FLASH_ATTN": "0",
-        "NVTE_FUSED_ATTN": "0",
-        "NVTE_UNFUSED_ATTN": "1",
-    }
+    environment = launch_environment(args.patch_root)
     (args.output / "launch.json").write_text(
         json.dumps({"argv": command, "env": environment}, indent=2) + "\n", encoding="utf-8"
     )
@@ -155,6 +225,7 @@ def run_patch(args, rows, record):
     logfile = args.output / "megatron.log"
     train_steps = []
     valid_loss = None
+    expected_topology = False
     with logfile.open("w", encoding="utf-8") as log, subprocess.Popen(
         command, env={**os.environ, **environment}, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
@@ -164,6 +235,13 @@ def run_patch(args, rows, record):
                 log.write(line)
                 log.flush()
                 print(line, end="", flush=True)
+                if f"using world size: {args.nproc_per_node}, data-parallel size: {args.nproc_per_node}," in line:
+                    fields = {field.strip() for field in line.split(",")}
+                    expected_topology = {
+                        "context-parallel size: 1",
+                        "tensor-model-parallel size: 1",
+                        "pipeline-model-parallel size: 1",
+                    }.issubset(fields)
                 match = TRAIN_LINE.search(line)
                 if match:
                     step, skipped, nan = match.groups()
@@ -184,16 +262,15 @@ def run_patch(args, rows, record):
         if process.wait():
             raise RuntimeError(f"Megatron exited with code {process.returncode}; see {logfile}")
 
+    if not expected_topology:
+        raise RuntimeError(f"Megatron did not log the expected DP topology; see {logfile}")
     if train_steps != list(range(1, args.steps + 1)) or valid_loss is None:
         raise RuntimeError(f"missing training steps or final validation loss; see {logfile}")
-    tracker = checkpoint / TRACKER
-    checkpoint_step = checkpoint / f"iter_{args.steps:07d}"
-    if (
-        not tracker.is_file()
-        or tracker.read_text(encoding="utf-8").strip() != str(args.steps)
-        or not (checkpoint_step / "common.pt").is_file()
-        or not (checkpoint_step / ".metadata").is_file()
-        or not any(checkpoint_step.glob("*.distcp"))
-    ):
-        raise RuntimeError(f"Megatron did not record a final checkpoint; see {logfile}")
+    try:
+        checkpoint_files(checkpoint, args.steps)
+    except ValueError as error:
+        raise RuntimeError(f"Megatron did not record a final checkpoint: {error}; see {logfile}") from error
+    if args.init_from:
+        check_warmstart(logfile, args.init_from, args.init_iteration)
+        checkpoint_files(args.init_from, args.init_iteration)
     return {"steps": args.steps, "valid_loss": valid_loss, "checkpoint": str(checkpoint)}

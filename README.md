@@ -25,7 +25,7 @@ python -m unittest discover -s tests -v
 | 预训练 | 5.5799 | 1.4930 |
 | SFT，加载预训练权重 | 2.5277 | 0.0341 |
 
-## Pai-Megatron-Patch 单卡实验
+## Pai-Megatron-Patch A800 实验
 
 使用支持 BF16 的 NVIDIA GPU，例如 A800，以及包含 CUDA、NCCL、Triton、Transformer Engine 和编译工具的 Pai-Megatron-Patch 环境。此例的 tokenizer 使用 Transformers 4.57.6，JSON-SFT 加载器需要 Hugging Face Datasets。[上游 Qwen3 指南和 PAI 25.04 镜像](https://github.com/alibaba/Pai-Megatron-Patch/blob/a098ca5acbdeaf7172ce0393fa309b39a77506db/examples/qwen3/README.md)
 
@@ -42,9 +42,20 @@ CUDA_VISIBLE_DEVICES=0 python -m src.train --backend megatron-patch \
   --init-from runs/patch-pretrain/checkpoint --output runs/patch-sft
 ```
 
-适配器通过 `torch.distributed.run` 调用上游 `examples/qwen3/pretrain_qwen.py`，使用两个 Transformer 层、hidden size 128 和 TP/PP/CP=1。预训练输入通过 Megatron-Core 写为 `.bin/.idx`。SFT 用 Patch 的 JSON-SFT 加载器读取转换后的 `query` 和 `response`，并应用本地模板。两种后端共享语料与 SFT loss mask 语义，各自使用自己的模型结构、采样实现和 checkpoint 格式。
+适配器通过 `torch.distributed.run` 调用上游 `examples/qwen3/pretrain_qwen.py`，使用两个 Transformer 层、hidden size 128 和 TP/PP/CP=1。`--nproc-per-node` 默认为 1，可在单节点增大 DP。global batch 必须能被进程数整除，每个 rank 的 micro-batch 为两者的商。预训练输入通过 Megatron-Core 写为 `.bin/.idx`。SFT 用 Patch 的 JSON-SFT 加载器读取转换后的 `query` 和 `response`，并应用本地模板。两种后端共享语料与 SFT loss mask 语义，各自使用自己的模型结构、采样实现和 checkpoint 格式。
 
-无 GPU 时可加入 `--prepare-only` 生成 tokenizer、数据和 `launch.json` 中的实际参数与环境变量。该模式的 `summary.json` 标记为 `prepared`。已在 CPU 上检查上游参数和两阶段数据读取，GPU 训练、分布式 checkpoint 保存和 SFT 热启仍需在 CUDA 环境验证。
+SFT 热启时，`--init-from` 指向含 tracker 的 `checkpoint/` 根目录。入口校验 `torch_dist` 产物，固定加载 iteration，并在训练完成后核对实际加载日志。可传 `--init-iteration` 显式断言 tracker 的预期值。上游 `--load` 仍指向本次 tokenizer，模型权重由 `--pretrained-checkpoint` 指定。
+
+```bash
+# CPU 上生成 1/2-rank 的预训练与 SFT 启动产物
+bash scripts/a800_smoke.sh ../Pai-Megatron-Patch runs/patch-prepare prepare
+
+# 目标节点执行单卡 4 步/阶段、双卡 DP2 2 步/阶段
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/a800_smoke.sh ../Pai-Megatron-Patch runs/a800-smoke all
+# 已分配一张卡时，可把 all 换成 single。也可单独执行 dp2。
+```
+
+各模式使用新输出目录。`prepare` 生成输入、tokenizer 和 `launch.json`，`summary.json` 标记为 `prepared`。实际 GPU smoke 检查 world size 和 DP 拓扑、连续且有限的 train loss、最终 valid loss、零 skipped/nan、`latest_checkpointed_iteration.txt` 及 `iter_*/` 下的 `common.pt`、`.metadata` 和 `*.distcp`。热启还须看到日志读取指定父目录和 iteration，并成功将 SFT 计数重置为 0。失败先查 `*.console.log` 和运行目录的 `megatron.log`。初始化失败时核对 CUDA、TE 与 NCCL，权重加载失败时核对 `launch.json` 的 tokenizer、父 checkpoint 路径和迭代号。真实 A800 验收需在目标环境运行。
 
 ## 自定义数据和产物
 
@@ -85,7 +96,34 @@ python -m src.rsi.run_round --demo --rounds 2 --generator-mode frozen --output r
 python -m src.rsi.run_round --demo --rounds 3 --planner dsh --output runs/rsi-dsh
 ```
 
-`run.json` 记录配置和数据哈希，`round_*/decision.json` 保存候选、生成器、父 checkpoint、入库统计与晋级依据，`best.json` 指向已晋级模型，`summary.json` 汇总 token 预算和盲测结果。RSI 的训练和采样当前使用 Torch CPU 后端。Pai-Megatron-Patch 可用现有独立训练入口，接入 RSI 还需要对接可供 rollout 使用的 Megatron checkpoint。
+`run.json` 记录配置和数据哈希，`round_*/decision.json` 保存候选、生成器、父 checkpoint、入库统计与晋级依据，`best.json` 指向已晋级模型，`summary.json` 汇总 token 预算和盲测结果。默认 RSI 后端为 Torch CPU。使用 `--backend megatron-patch` 时，RSI 在单卡上以原生 Megatron 模型读取 `torch_dist` checkpoint。提供同一训练入口产生的算术 seed checkpoint 根目录与原运行目录中的 `config.json`、`launch.json` 和 `tokenizer/`。初始化时记录模型文件摘要。后续训练与 rollout 固定加载 iteration，tracker 漂移会报错。Patch 实际训练的 `supervised_tokens` 尚未采集，训练发生时该字段为 `null`，`train_token_slots` 仍按配置计入预算。
+
+可用以下命令生成算术 fixture，并在分配到一张 A800 后训练种子模型及尝试一轮 RSI。输出目录均需为新路径。
+
+```bash
+python - <<'PYTHON'
+from pathlib import Path
+from src.rsi.data import as_sft, load_splits, make_demo, write_jsonl
+
+data = Path("runs/patch-rsi-data")
+data.parent.mkdir(parents=True, exist_ok=True)
+make_demo(data)
+splits, _ = load_splits(data, seq_len=64, max_new_tokens=4)
+for split in ("replay", "monitor"):
+    write_jsonl(data / f"sft-{split}.jsonl", map(as_sft, splits[split]))
+PYTHON
+
+CUDA_VISIBLE_DEVICES=0 python -m src.train --backend megatron-patch \
+  --patch-root ../Pai-Megatron-Patch --stage sft --steps 100 \
+  --train-data runs/patch-rsi-data/sft-replay.jsonl \
+  --valid-data runs/patch-rsi-data/sft-monitor.jsonl --output runs/patch-rsi-seed
+
+CUDA_VISIBLE_DEVICES=0 python -m src.rsi.run_round --backend megatron-patch \
+  --patch-root ../Pai-Megatron-Patch --data-dir runs/patch-rsi-data \
+  --init-from runs/patch-rsi-seed/checkpoint --rounds 1 --steps 4 --output runs/patch-rsi
+```
+
+查看 `round_001/rollouts.jsonl`、`training/megatron.log`、`dev.jsonl`、`decision.json` 与最终 `best.json`。采样日志及其启动参数和输入保存在同目录。如果 `stop_reason` 为 `insufficient_positive_coverage`，检查 rollout 中正确且带 EOS 的样本数与 prompt 覆盖后，再调整种子模型或采样预算。
 
 ## 后续实现
 
