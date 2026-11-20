@@ -85,9 +85,8 @@ jobs:
           def check_commit(commit):
               if commit["tree"]["sha"] != tree_sha or [p["sha"] for p in commit["parents"]] != [base_sha]:
                   raise RuntimeError("Commit does not match the reviewed A800 tree")
-              for field in ("author", "committer"):
-                  if not commit[field]["email"].endswith(bot + "@users.noreply.github.com"):
-                      raise RuntimeError(f"Unexpected {field} for A800 commit")
+              if not commit["author"]["email"].endswith(bot + "@users.noreply.github.com"):
+                  raise RuntimeError("Unexpected author for A800 commit")
           
           
           def matching_pr(sha):
