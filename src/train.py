@@ -129,6 +129,8 @@ def parse_args(argv=None):
     parser.add_argument("--valid-data", type=Path)
     parser.add_argument("--init-from", type=Path, help="pretrain or SFT checkpoint from the same backend")
     parser.add_argument("--patch-root", type=Path, help="Pai-Megatron-Patch checkout")
+    parser.add_argument("--nproc-per-node", type=int, help="single-node Patch data-parallel processes")
+    parser.add_argument("--init-iteration", type=int, help="expected Patch checkpoint tracker iteration")
     parser.add_argument("--prepare-only", action="store_true", help="prepare Patch inputs without a GPU")
     args = parser.parse_args(argv)
 
@@ -143,8 +145,17 @@ def parse_args(argv=None):
         parser.error("--init-from is supported for SFT")
     if args.backend == "megatron-patch" and not args.patch_root:
         parser.error("--backend megatron-patch requires --patch-root")
-    if args.backend == "torch" and (args.patch_root or args.prepare_only):
-        parser.error("--patch-root and --prepare-only require --backend megatron-patch")
+    if args.backend == "torch" and (
+        args.patch_root or args.prepare_only or args.nproc_per_node is not None or args.init_iteration is not None
+    ):
+        parser.error("Patch-specific options require --backend megatron-patch")
+    if args.backend == "megatron-patch":
+        if args.nproc_per_node is None:
+            args.nproc_per_node = 1
+        if args.nproc_per_node < 1 or args.batch_size % args.nproc_per_node:
+            parser.error("--nproc-per-node must be positive and divide --batch-size")
+        if args.init_iteration is not None and (args.init_iteration < 1 or not args.init_from):
+            parser.error("--init-iteration must be positive and requires --init-from")
 
     for name, value in vars(args).items():
         if isinstance(value, Path):

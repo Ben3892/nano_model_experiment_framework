@@ -1,4 +1,4 @@
-"""Run a bounded verifier-guided recursive SFT experiment on CPU."""
+"""Run a bounded verifier-guided recursive SFT experiment."""
 
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
@@ -10,9 +10,11 @@ import sys
 
 import torch
 
+from ..megatron_patch_backend import check_gpus, check_patch_root
 from ..train import load_torch_checkpoint, main as train_main, write_json
 from .data import as_sft, load_splits, make_demo, select_sft, write_jsonl
 from .evaluate import metrics, promotion, question_scores, sample
+from .megatron_rollout import PatchCheckpoint, sample_patch
 from .planner import MAX_REPLAY, MIN_REPLAY, dsh_plan, resolve_dsh
 
 
@@ -21,7 +23,9 @@ def parse_args(argv=None):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--demo", action="store_true", help="use the toy math fixture and bootstrap a seed checkpoint")
     source.add_argument("--data-dir", type=Path, help="directory with rollout/replay/monitor/dev/blind JSONL splits")
-    parser.add_argument("--init-from", type=Path, help="Torch pretrain or SFT checkpoint for custom data")
+    parser.add_argument("--init-from", type=Path, help="Torch checkpoint file or Patch checkpoint directory")
+    parser.add_argument("--backend", choices=("torch", "megatron-patch"), default="torch")
+    parser.add_argument("--patch-root", type=Path, help="Pai-Megatron-Patch checkout")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--generator-mode", choices=("recursive", "frozen"), default="recursive")
     parser.add_argument("--planner", choices=("fixed", "dsh"), default="fixed")
@@ -52,6 +56,12 @@ def parse_args(argv=None):
 
     if args.demo == bool(args.init_from):
         parser.error("provide --init-from with --data-dir, or use --demo on its own")
+    if args.backend == "megatron-patch":
+        if args.demo or not args.patch_root:
+            parser.error("Patch RSI requires --patch-root, --data-dir and --init-from")
+        args.patch_root = args.patch_root.resolve()
+    elif args.patch_root:
+        parser.error("--patch-root requires --backend megatron-patch")
     for key in ("dsh_timeout", "rounds", "patience", "steps", "demo_bootstrap_steps", "seq_len", "batch_size",
                 "samples", "eval_samples", "top_k", "max_new_tokens", "min_positive_prompts",
                 "min_fresh_supervised_tokens", "max_fresh_supervised_tokens", "max_generated_tokens",
@@ -79,27 +89,49 @@ def fit(args, directory, rows, monitor, steps, seed, parent=None):
         "--seq-len", str(args.seq_len), "--batch-size", str(args.batch_size), "--seed", str(seed),
         "--lr", str(args.lr), "--train-data", str(train_file), "--valid-data", str(valid_file),
     ]
+    if args.backend == "megatron-patch":
+        parent.check_tracker()
+        command += [
+            "--backend", "megatron-patch", "--patch-root", str(args.patch_root),
+            "--init-iteration", str(parent.iteration),
+        ]
     if parent:
-        command += ["--init-from", str(parent)]
+        command += ["--init-from", str(checkpoint_path(parent))]
     with (directory / "training.log").open("w", encoding="utf-8") as log:
         with redirect_stdout(log), redirect_stderr(log):
             status = train_main(command)
-    checkpoint = output / "checkpoint.pt"
-    if status or not checkpoint.is_file():
+    if status:
         raise RuntimeError(f"SFT failed in {directory.name}; see {directory / 'training.log'}")
     result = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    checkpoint = Path(result["checkpoint"])
+    if args.backend == "megatron-patch":
+        return PatchCheckpoint.read(checkpoint, args.seq_len), result.get("supervised_tokens")
+    if not checkpoint.is_file():
+        raise RuntimeError(f"missing Torch checkpoint: {checkpoint}")
     return checkpoint, result["supervised_tokens"]
 
 
-def score(model, questions, args, seed, path):
-    rows = sample(model, questions, args.eval_samples, args, seed)
+def checkpoint_path(checkpoint):
+    return checkpoint.root if isinstance(checkpoint, PatchCheckpoint) else checkpoint
+
+
+def sample_checkpoint(checkpoint, questions, count, args, seed, path):
+    if isinstance(checkpoint, PatchCheckpoint):
+        return sample_patch(checkpoint, questions, count, args, seed, path)
+    return sample(load_torch_checkpoint(checkpoint), questions, count, args, seed)
+
+
+def score(checkpoint, questions, args, seed, path):
+    rows = sample_checkpoint(checkpoint, questions, args.eval_samples, args, seed, path)
     scores = question_scores(questions, rows, args.eval_samples)
     write_jsonl(path, scores)
     return scores
 
 
 def save_best(root, checkpoint, round_number, scores):
-    result = {"checkpoint": str(checkpoint), "round": round_number, "dev": metrics(scores)}
+    result = {"checkpoint": str(checkpoint_path(checkpoint)), "round": round_number, "dev": metrics(scores)}
+    if isinstance(checkpoint, PatchCheckpoint):
+        result["checkpoint_metadata"] = checkpoint.metadata()
     temp = root / ".best.tmp"
     write_json(temp, result)
     temp.replace(root / "best.json")
@@ -107,6 +139,9 @@ def save_best(root, checkpoint, round_number, scores):
 
 def run(args):
     torch.set_num_threads(1)
+    if args.backend == "megatron-patch":
+        check_patch_root(args.patch_root)
+        check_gpus(1)
     root = args.output.resolve()
     executable = resolve_dsh(args.dsh_bin) if args.planner == "dsh" else None
     root.mkdir(parents=True, exist_ok=False)
@@ -134,20 +169,24 @@ def run(args):
             args, directory, list(map(as_sft, splits["replay"])),
             splits["monitor"], args.demo_bootstrap_steps, args.seed,
         )
+    elif args.backend == "megatron-patch":
+        origin = PatchCheckpoint.read(args.init_from, args.seq_len)
     else:
         origin = root / "initial_checkpoint.pt"
         shutil.copyfile(args.init_from, origin)
-    model = load_torch_checkpoint(origin)
-    if model.config.max_seq_len != args.seq_len:
-        raise ValueError("--seq-len must match the initial checkpoint")
-    with origin.open("rb") as checkpoint_file:
-        digest = hashlib.file_digest(checkpoint_file, "sha256").hexdigest()
-    write_json(root / "initial_checkpoint.json", {
-        "path": str(origin), "sha256": digest,
-    })
+    if isinstance(origin, PatchCheckpoint):
+        initial_metadata = origin.metadata()
+    else:
+        model = load_torch_checkpoint(origin)
+        if model.config.max_seq_len != args.seq_len:
+            raise ValueError("--seq-len must match the initial checkpoint")
+        with origin.open("rb") as checkpoint_file:
+            digest = hashlib.file_digest(checkpoint_file, "sha256").hexdigest()
+        initial_metadata = {"path": str(origin), "sha256": digest}
+    write_json(root / "initial_checkpoint.json", initial_metadata)
     # All candidates use the same per-question random seeds on dev.
     eval_seed = args.seed + 10_000
-    best_scores = score(model, splits["dev"], args, eval_seed, root / "dev_initial.jsonl")
+    best_scores = score(origin, splits["dev"], args, eval_seed, root / "dev_initial.jsonl")
     initial = metrics(best_scores)
     best = origin
     save_best(root, best, 0, best_scores)
@@ -166,18 +205,22 @@ def run(args):
         directory = root / f"round_{number:03d}"
         directory.mkdir()
         generator = best if args.generator_mode == "recursive" else origin
-        rollouts = sample(load_torch_checkpoint(generator), splits["rollout"], args.samples, args,
-                          args.seed + number)
+        rollout_path = directory / "rollouts.jsonl"
+        rollouts = sample_checkpoint(generator, splits["rollout"], args.samples, args,
+                                     args.seed + number, rollout_path)
         generated_used += rollout_cost
-        write_jsonl(directory / "rollouts.jsonl", rollouts)
+        write_jsonl(rollout_path, rollouts)
         rows, data_report = select_sft(
             splits["rollout"], rollouts, splits["replay"], replay, args.seed + number,
             args.max_fresh_supervised_tokens,
         )
         outcome = {
-            "round": number, "parent": str(best), "generator": str(generator),
+            "round": number, "parent": str(checkpoint_path(best)),
+            "generator": str(checkpoint_path(generator)),
             "rollout_seed": args.seed + number, "data": data_report,
         }
+        if isinstance(best, PatchCheckpoint):
+            outcome.update(parent_iteration=best.iteration, generator_iteration=generator.iteration)
         if (
             data_report["positive_prompts"] < args.min_positive_prompts
             or data_report["fresh_supervised_tokens"] < args.min_fresh_supervised_tokens
@@ -193,12 +236,16 @@ def run(args):
             args, directory, rows, splits["monitor"], args.steps, args.seed + number, parent=best,
         )
         train_used += args.steps * step_cost
-        supervised_used += supervised
-        candidate_scores = score(load_torch_checkpoint(candidate), splits["dev"], args, eval_seed,
-                                 directory / "dev.jsonl")
+        supervised_used = (
+            supervised_used + supervised if supervised_used is not None and supervised is not None else None
+        )
+        candidate_scores = score(candidate, splits["dev"], args, eval_seed, directory / "dev.jsonl")
         generated_used += dev_cost
         result = promotion(best_scores, candidate_scores, args.min_gain, args.max_regression, eval_seed)
-        outcome.update(result, checkpoint=str(candidate), status="evaluated", supervised_tokens=supervised)
+        outcome.update(result, checkpoint=str(checkpoint_path(candidate)),
+                       status="evaluated", supervised_tokens=supervised)
+        if isinstance(candidate, PatchCheckpoint):
+            outcome["checkpoint_metadata"] = candidate.metadata()
         write_json(directory / "decision.json", outcome)
         outcomes.append(outcome)
         print(f"round {number}: pass@1 change {result['gain']:+.4f}, promoted={result['promoted']}", flush=True)
@@ -223,20 +270,23 @@ def run(args):
             }
             replay = dsh_plan(executable, args.dsh_timeout, report, directory, replay)
 
-    blind_initial = score(load_torch_checkpoint(origin), splits["blind"], args, eval_seed + 1,
+    blind_initial = score(origin, splits["blind"], args, eval_seed + 1,
                           root / "blind_initial.jsonl")
     generated_used += blind_cost
     blind_best = blind_initial
     if best != origin:
-        blind_best = score(load_torch_checkpoint(best), splits["blind"], args, eval_seed + 1,
+        blind_best = score(best, splits["blind"], args, eval_seed + 1,
                            root / "blind_best.jsonl")
         generated_used += blind_cost
     result = {
-        "stop_reason": reason, "best_checkpoint": str(best), "initial_dev": initial, "best_dev": metrics(best_scores),
+        "stop_reason": reason, "best_checkpoint": str(checkpoint_path(best)),
+        "initial_dev": initial, "best_dev": metrics(best_scores),
         "blind_initial": metrics(blind_initial), "blind_best": metrics(blind_best),
         "generation_token_slots": generated_used, "train_token_slots": train_used,
         "supervised_tokens": supervised_used, "rounds": outcomes,
     }
+    if isinstance(best, PatchCheckpoint):
+        result["best_checkpoint_metadata"] = best.metadata()
     write_json(root / "summary.json", result)
     return result
 
