@@ -55,7 +55,20 @@ CUDA_VISIBLE_DEVICES=0,1 bash scripts/a800_smoke.sh ../Pai-Megatron-Patch runs/a
 # 已分配一张卡时，可把 all 换成 single。也可单独执行 dp2。
 ```
 
-各模式使用新输出目录。`prepare` 生成输入、tokenizer 和 `launch.json`，`summary.json` 标记为 `prepared`。实际 GPU smoke 检查 world size 和 DP 拓扑、连续且有限的 train loss、最终 valid loss、零 skipped/nan、`latest_checkpointed_iteration.txt` 及 `iter_*/` 下的 `common.pt`、`.metadata` 和 `*.distcp`。热启还须看到日志读取指定父目录和 iteration，并成功将 SFT 计数重置为 0。失败先查 `*.console.log` 和运行目录的 `megatron.log`。初始化失败时核对 CUDA、TE 与 NCCL，权重加载失败时核对 `launch.json` 的 tokenizer、父 checkpoint 路径和迭代号。真实 A800 验收需在目标环境运行。
+各模式使用新输出目录。`prepare` 生成输入、tokenizer 和 `launch.json`，`summary.json` 标记为 `prepared`。实际 GPU smoke 检查 world size 和 DP 拓扑、连续且有限的 train loss、最终 valid loss、零 skipped/nan、`latest_checkpointed_iteration.txt` 及 `iter_*/` 下的 `common.pt`、`.metadata`、`*.distcp` 和 `metadata.json`。后者声明分片后端 `torch_dist`，适配器按锁定版本检查分片与公共存储后端及版本。热启还须看到日志读取指定父目录和 iteration，并成功将 SFT 计数重置为 0。失败先查 `*.console.log` 和运行目录的 `megatron.log`。初始化失败时核对 CUDA、TE 与 NCCL，权重加载失败时核对 `launch.json` 的 tokenizer、父 checkpoint 路径和迭代号。真实 A800 验收需在目标环境运行。
+
+### 单卡验证已有 checkpoint 的原生 rollout
+
+运行过上面的 `all` 后，可在一张 A800 上分别加载单卡和 DP2 的预训练产物。下面两条命令各启动一个单 rank worker，固定 seed 42，仅对一题生成一个样本。保留父运行目录里的 `config.json`、`launch.json` 与 `tokenizer/`。最后一个参数是预期的 tracker iteration，各次使用新的输出目录。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/a800_smoke.sh ../Pai-Megatron-Patch runs/probe-dp1 \
+  rollout runs/a800-smoke/dp1-pretrain/checkpoint 4
+CUDA_VISIBLE_DEVICES=0 bash scripts/a800_smoke.sh ../Pai-Megatron-Patch runs/probe-dp2 \
+  rollout runs/a800-smoke/dp2-pretrain/checkpoint 2
+```
+
+检查 `probe.megatron.log` 中的父路径、iteration 和成功加载行，`probe.{launch,request,response}.json` 保存原始证据。通过时 `summary.json` 中 `status=sampled`、`checkpoint_metadata.iteration` 与预期一致，`sample.id=probe`、`sample.sample=0`。此项验收仅要求真实加载与生成，`wrong` 或 `no_eos` 均可通过。RSI 记录的 `file_sha256` 包含格式清单 `metadata.json`。
 
 ## 自定义数据和产物
 

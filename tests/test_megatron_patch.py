@@ -1,5 +1,6 @@
 import contextlib
 import io
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -16,6 +17,7 @@ from src.megatron_patch_backend import (
 )
 from src.rsi.data import make_demo
 from src.rsi.megatron_rollout import MegatronGenerator, PatchCheckpoint, sample_patch
+from src.rsi.rollout_smoke import main as smoke_rollout
 from src.rsi.run_round import main as run_rsi
 from src.train import main as train, parse_args, write_json
 
@@ -26,13 +28,18 @@ def fake_patch(root):
         path.touch()
 
 
-def fake_checkpoint(run, iteration):
-    root = run / "checkpoint"
+def write_checkpoint_files(root, iteration):
     step = root / f"iter_{iteration:07d}"
     step.mkdir(parents=True)
     for name in ("common.pt", ".metadata", "__0_0.distcp"):
         (step / name).write_bytes(b"test checkpoint bytes")
+    write_json(step / "metadata.json", {"sharded_backend": "torch_dist", "sharded_backend_version": 1})
     (root / TRACKER).write_text(f"{iteration}\n")
+
+
+def fake_checkpoint(run, iteration):
+    root = run / "checkpoint"
+    write_checkpoint_files(root, iteration)
     tokenizer = run / "tokenizer"
     write_tokenizer(tokenizer)
     args = parse_args([
@@ -52,6 +59,63 @@ def warmstart_log(parent, iteration):
 
 
 class PatchTests(unittest.TestCase):
+    def test_checkpoint_rejects_missing_invalid_or_unsupported_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = fake_checkpoint(Path(directory) / "seed", 4)
+            manifest = parent / "iter_0000004/metadata.json"
+            manifest.unlink()
+            with self.assertRaisesRegex(ValueError, "metadata.json"):
+                checkpoint_files(parent)
+            for contents in (
+                "{", "null", "{}", '{"sharded_backend": "torch_dcp"}',
+                '{"sharded_backend": "torch_dist", "sharded_backend_version": 2}',
+                '{"sharded_backend": "torch_dist", "sharded_backend_version": true}',
+                '{"sharded_backend": "torch_dist", "common_backend": "unknown"}',
+                '{"sharded_backend": "torch_dist", "common_backend_version": 2}',
+            ):
+                with self.subTest(contents=contents), self.assertRaisesRegex(ValueError, "metadata.json"):
+                    manifest.write_text(contents)
+                    checkpoint_files(parent)
+            write_json(manifest, {"sharded_backend": "torch_dist"})
+            checkpoint = PatchCheckpoint.read(parent, 64)
+            self.assertEqual(checkpoint.sha256["checkpoint/iter_0000004/metadata.json"],
+                             hashlib.sha256(manifest.read_bytes()).hexdigest())
+
+    def test_rollout_smoke_runs_one_sample_without_requiring_correct_answer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            patch_root, output = root / "patch", root / "probe"
+            fake_patch(patch_root)
+            parent = fake_checkpoint(root / "seed", 4)
+            command = ["--patch-root", str(patch_root), "--init-from", str(parent), "--output", str(output)]
+            row = {"id": "probe", "sample": 0, "response": "", "result": "no_eos"}
+
+            def worker(argv, stdout, **kwargs):
+                self.assertIn("--nproc-per-node=1", argv)
+                self.assertEqual(argv[argv.index("--ckpt-step") + 1], "4")
+                self.assertEqual(argv[argv.index("--pretrained-checkpoint") + 1], str(parent))
+                request = json.loads((output / "probe.request.json").read_text())
+                self.assertEqual((len(request["questions"]), request["count"], request["seed"]), (1, 1, 42))
+                write_json(output / "probe.response.json", [row])
+                stdout.write(warmstart_log(parent, 4))
+                return subprocess.CompletedProcess(argv, 0)
+
+            with patch("src.rsi.rollout_smoke.check_gpus"), patch(
+                "src.rsi.megatron_rollout.subprocess.run", side_effect=worker
+            ) as launch:
+                with self.assertRaisesRegex(ValueError, "changed from 3 to 4"):
+                    smoke_rollout([*command, "--init-iteration", "3"])
+                self.assertFalse(output.exists())
+                smoke_rollout([*command, "--init-iteration", "4"])
+                with self.assertRaises(FileExistsError):
+                    smoke_rollout([*command, "--init-iteration", "4"])
+                launch.assert_called_once()
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual((summary["status"], summary["sample"]), ("sampled", row))
+            self.assertEqual(summary["checkpoint_metadata"]["iteration"], 4)
+            for suffix in ("request.json", "launch.json", "response.json", "megatron.log"):
+                self.assertTrue((output / f"probe.{suffix}").stat().st_size)
+
     def test_dp2_prepare_checks_parent_and_launch_paths(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             root = Path(directory)
@@ -91,11 +155,7 @@ class PatchTests(unittest.TestCase):
 
             def fake_child(argv, **kwargs):
                 checkpoint = Path(argv[argv.index("--save") + 1])
-                step = checkpoint / "iter_0000001"
-                step.mkdir(parents=True)
-                for name in ("common.pt", ".metadata", "__0_0.distcp"):
-                    (step / name).write_bytes(b"test checkpoint bytes")
-                (checkpoint / TRACKER).write_text("1\n")
+                write_checkpoint_files(checkpoint, 1)
                 child = MagicMock()
                 child.__enter__.return_value = child
                 child.stdout = io.StringIO(good_lines)
