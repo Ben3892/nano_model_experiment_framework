@@ -40,7 +40,25 @@ def checkpoint_files(root, expected_iteration=None):
     files = [step_dir / "common.pt", step_dir / ".metadata", *shards]
     if not shards or any(not path.is_file() or not path.stat().st_size for path in files):
         raise ValueError(f"incomplete torch_dist checkpoint: {step_dir}")
-    return iteration, files
+    # Megatron uses metadata.json to distinguish torch_dist from torch_dcp.
+    manifest = step_dir / "metadata.json"
+    if not manifest.is_file():
+        raise ValueError(f"missing torch_dist format manifest: {manifest}")
+    try:
+        metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid torch_dist format manifest: {manifest}: {error}") from error
+    # Match CheckpointingConfig defaults and the strategies in Megatron-LM-250624.
+    supported = {
+        "sharded_backend": "torch_dist", "sharded_backend_version": 1,
+        "common_backend": "torch", "common_backend_version": 1,
+    }
+    if not isinstance(metadata, dict) or "sharded_backend" not in metadata:
+        raise ValueError(f"missing sharded_backend in {manifest}")
+    for name, value in metadata.items():
+        if name not in supported or type(value) is not type(supported[name]) or value != supported[name]:
+            raise ValueError(f"unsupported {name}={value!r} in {manifest}")
+    return iteration, [*files, manifest]
 
 
 def check_patch_root(root):

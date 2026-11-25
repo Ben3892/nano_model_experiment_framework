@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (( $# < 2 || $# > 3 )); then
+usage() {
   echo "Usage: bash scripts/a800_smoke.sh PATCH_ROOT OUTPUT [all|single|dp2|prepare]" >&2
+  echo "       bash scripts/a800_smoke.sh PATCH_ROOT OUTPUT rollout CHECKPOINT ITERATION" >&2
   exit 2
-fi
+}
 
 mode=${3:-all}
 case "$mode" in
-  all|single|dp2|prepare) ;;
-  *) echo "Unknown mode: $mode" >&2; exit 2 ;;
+  all|single|dp2|prepare) (( $# == 2 || $# == 3 )) || usage ;;
+  rollout)
+    (( $# == 5 )) || usage
+    checkpoint="$(realpath "$4")"
+    ;;
+  *) usage ;;
 esac
 patch_root="$(realpath "$1")"
 output="$(realpath -m "$2")"
 cd "$(dirname "$0")/.."
-mkdir -p "$(dirname "$output")"
-mkdir "$output"
 
 python_bin="${PYTHON_BIN:-python}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}" PYTHONUNBUFFERED=1
@@ -23,6 +26,14 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$output/hf-datasets}"
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 unset TORCH_FORCE_WEIGHTS_ONLY_LOAD
+if [[ "$mode" == rollout ]]; then
+  device=${SMOKE_GPU_DEVICES-${CUDA_VISIBLE_DEVICES-0}}
+  CUDA_VISIBLE_DEVICES="${device%%,*}" exec "$python_bin" -m src.rsi.rollout_smoke \
+    --patch-root "$patch_root" --output "$output" --init-from "$checkpoint" --init-iteration "$5"
+fi
+
+mkdir -p "$(dirname "$output")"
+mkdir "$output"
 args=(--backend megatron-patch --patch-root "$patch_root" --seq-len 64
       --batch-size 4 --eval-batches 2 --seed 42 --lr 0.001)
 

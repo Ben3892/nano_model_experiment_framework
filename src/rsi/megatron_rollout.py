@@ -38,9 +38,9 @@ class PatchCheckpoint:
     sha256: dict[str, str]
 
     @classmethod
-    def read(cls, root, seq_len):
+    def read(cls, root, seq_len, expected_iteration=None):
         root = root.resolve()
-        iteration, files = checkpoint_files(root)
+        iteration, files = checkpoint_files(root, expected_iteration)
         run = root.parent
         config_path = run / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
